@@ -1,0 +1,1099 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import builtins
+import sys
+import re
+import csv
+import json
+import time
+import traceback
+from io import StringIO
+from datetime import datetime
+from collections import OrderedDict
+
+import requests
+from zenv import get_zdkit_env
+from zdbase import ZFile  # 保留平台兼容，不直接依赖
+
+
+# =============================================================================
+# 日志编码兜底
+# =============================================================================
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+
+# =============================================================================
+# print flush patch
+# =============================================================================
+
+if not getattr(builtins.print, "_patched_flush", False):
+    _original_print = builtins.print
+
+    def print(*args, **kwargs):
+        kwargs.setdefault("flush", True)
+        _original_print(*args, **kwargs)
+
+    print._patched_flush = True
+    builtins.print = print
+
+
+# =============================================================================
+# 固定 API 路由
+# =============================================================================
+
+TODO_BASE_URL = "http://share.cxmt.com"
+TODO_LIST_API = "/openapi/todo/todoList"
+
+ACCESS_TOKEN_ROUTE = "/api/user/platform/getAccessToken"
+DOC_TREE_ROUTE = "/platform/api/main/doc/treeList"
+SIGNED_URL_ROUTE = "/platform/api/main/storage/getSignedUrl"
+NOTE_JSON_ROUTE = "/platform/ws/noteInfo/getDocJson"
+MD_INSERT_ROUTE = "/middle/server/api/file/md/insert"
+
+
+# =============================================================================
+# 固定业务参数
+# =============================================================================
+
+TODO_STATUS_LIST = ["Open", "Ongoing"]
+TODO_IS_LEAF = True
+
+DAILY_SECTION_TITLE = "TodoList任务进展"
+DAILY_TITLE_KEYWORDS = ["日报"]
+
+DAILY_INSERT_MODE = "a"
+DAILY_INSERT_LOCATION = 1
+
+MAPPING_DEPT_FIELD = "Dept"
+MAPPING_PROJECT_GUID_FIELD = "project_guid"
+MAPPING_WORK_LOG_FOLDER_GUID_FIELD = "work_log_folder_guid"
+MAPPING_PROJECT_NAME_FIELD = "project_name"
+
+SKIP_EXISTING_SUBTODO = True
+
+RISK_MAP = {
+    "high": "高",
+    "middle": "中",
+    "low": "低"
+}
+
+
+# =============================================================================
+# 全局配置加载
+# =============================================================================
+
+zenv_obj = get_zdkit_env()
+BASE_URL = zenv_obj.zdkit._http_client.config.get("url")
+
+try:
+    with open(config_file.path, "r", encoding="utf-8") as config_fp:
+        config = json.load(config_fp)
+except Exception as e:
+    print(f"❌ 配置文件读取失败: {e}")
+    raise
+
+AK = config.get("ak")
+SK = config.get("sk")
+ORG_GUID = config.get("org_guid")
+USER_GUID = config.get("user_guid")
+
+OWNER_GUID_LIST = config.get("owner_guid") or []
+MAPPING_GUID = config.get("mapping_guid")
+TARGET_DATE = config.get("target_date") or datetime.now().strftime("%Y-%m-%d")
+
+if not AK or not SK:
+    raise ValueError("配置错误：缺少 ak / sk")
+
+if not USER_GUID:
+    raise ValueError("配置错误：缺少 user_guid")
+
+if not OWNER_GUID_LIST:
+    OWNER_GUID_LIST = [USER_GUID]
+
+if isinstance(OWNER_GUID_LIST, str):
+    OWNER_GUID_LIST = [OWNER_GUID_LIST]
+
+OWNER_GUID_LIST = [x for x in OWNER_GUID_LIST if x]
+
+if not MAPPING_GUID:
+    raise ValueError("配置错误：缺少 mapping_guid")
+
+
+# =============================================================================
+# 通用 HTTP 工具
+# =============================================================================
+
+def request_with_retry(method, url, max_retries=3, **kwargs):
+    kwargs.setdefault("timeout", 30)
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            if method.lower() == "post":
+                response = requests.post(url, **kwargs)
+            else:
+                response = requests.get(url, **kwargs)
+
+            return response
+
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            last_error = e
+            if attempt < max_retries:
+                wait = min(2 ** attempt, 10)
+                print(f"⚠️ 请求失败，第 {attempt}/{max_retries} 次，{wait}s 后重试: {e}")
+                time.sleep(wait)
+            else:
+                raise last_error
+
+
+def get_headers_with_ak(user_guid=""):
+    response = request_with_retry(
+        "post",
+        BASE_URL + ACCESS_TOKEN_ROUTE,
+        json={
+            "ak": AK,
+            "sk": SK
+        },
+        timeout=30
+    )
+
+    response_json = response.json()
+
+    if not response_json.get("data"):
+        raise Exception(f"获取 AccessToken 失败: {response_json}")
+
+    access_token = response_json["data"].get("accessToken")
+
+    if not access_token:
+        raise Exception(f"AccessToken 不存在: {response_json}")
+
+    return {
+        "Access-Token": access_token,
+        "ak": AK,
+        "X-User-GUID": user_guid or USER_GUID,
+        "Content-Type": "application/json"
+    }
+
+
+# =============================================================================
+# mapping 文件读取
+# =============================================================================
+
+def get_signed_url(category_guid):
+    response = request_with_retry(
+        "get",
+        BASE_URL + SIGNED_URL_ROUTE,
+        headers=get_headers_with_ak(),
+        params={
+            "categoryGuid": category_guid
+        },
+        timeout=30
+    )
+
+    response_json = response.json()
+    signed_url = (response_json.get("data") or {}).get("signedUrl")
+
+    if not signed_url:
+        raise Exception(f"获取 signedUrl 失败: {response_json}")
+
+    return signed_url
+
+
+def normalize_dept_name(dept_name):
+    """
+    统一部门路径格式：
+    - 去掉空格
+    - 统一斜杠
+    - 去掉首尾斜杠
+    - 小写
+
+    例如：
+    AIX/AIX 2/AIX 2 -> aix/aix2/aix2
+    AIX\\AIX2\\AIX2 -> aix/aix2/aix2
+    """
+    text = str(dept_name or "").strip()
+    text = text.replace("\\", "/")
+    text = re.sub(r"\s+", "", text)
+    text = re.sub(r"/+", "/", text)
+    text = text.strip("/")
+    return text.lower()
+
+
+def parse_csv_mapping(text):
+    """
+    读取 CSV mapping。
+
+    必须字段：
+    Dept,project_guid,work_log_folder_guid
+
+    可选字段：
+    project_name
+    """
+    text = text.lstrip("\ufeff").strip()
+
+    if not text:
+        raise ValueError("mapping 文件内容为空")
+
+    reader = csv.DictReader(StringIO(text))
+    rows = []
+
+    for row in reader:
+        if not row:
+            continue
+
+        dept = (row.get(MAPPING_DEPT_FIELD) or "").strip()
+        project_guid = (row.get(MAPPING_PROJECT_GUID_FIELD) or "").strip()
+        work_log_folder_guid = (row.get(MAPPING_WORK_LOG_FOLDER_GUID_FIELD) or "").strip()
+        project_name = (row.get(MAPPING_PROJECT_NAME_FIELD) or "").strip()
+
+        if not dept:
+            print(f"⚠️ 跳过 mapping 行：缺少 Dept -> {row}")
+            continue
+
+        if not project_guid:
+            print(f"⚠️ 跳过 mapping 行：缺少 project_guid -> {row}")
+            continue
+
+        if not work_log_folder_guid:
+            print(f"⚠️ 跳过 mapping 行：缺少 work_log_folder_guid -> {row}")
+            continue
+
+        rows.append({
+            "dept": dept,
+            "dept_norm": normalize_dept_name(dept),
+            "project_guid": project_guid,
+            "work_log_folder_guid": work_log_folder_guid,
+            "project_name": project_name
+        })
+
+    if not rows:
+        raise ValueError("mapping 文件中没有有效记录")
+
+    return rows
+
+
+def load_mapping_from_guid(mapping_guid):
+    print(f"🚀 开始读取 mapping 文件: {mapping_guid}")
+
+    signed_url = get_signed_url(mapping_guid)
+
+    response = request_with_retry(
+        "get",
+        signed_url,
+        timeout=60
+    )
+
+    if response.status_code != 200:
+        raise Exception(
+            f"下载 mapping 文件失败: status={response.status_code}, text={response.text[:300]}"
+        )
+
+    mapping_rows = parse_csv_mapping(response.text)
+
+    print(f"✅ mapping 文件读取成功，有效记录数: {len(mapping_rows)}")
+
+    return mapping_rows
+
+
+def find_mapping_by_dept(full_dept_name, mapping_rows):
+    """
+    用 subTodo.owner.fullDeptName 匹配 mapping.Dept。
+
+    当前策略：
+    1. 标准化后完全匹配
+    2. 如果完全匹配失败，尝试前缀匹配
+    """
+    dept_norm = normalize_dept_name(full_dept_name)
+
+    if not dept_norm:
+        return None
+
+    # 1. 完全匹配
+    for row in mapping_rows:
+        if row["dept_norm"] == dept_norm:
+            return row
+
+    # 2. mapping 比 fullDept 更短时，允许 fullDept 以 mapping 开头
+    candidates = []
+    for row in mapping_rows:
+        map_dept_norm = row["dept_norm"]
+        if dept_norm.startswith(map_dept_norm + "/") or dept_norm == map_dept_norm:
+            candidates.append(row)
+
+    if candidates:
+        candidates.sort(key=lambda x: len(x["dept_norm"]), reverse=True)
+        return candidates[0]
+
+    # 3. fullDept 比 mapping 更短时，允许 mapping 以 fullDept 开头
+    candidates = []
+    for row in mapping_rows:
+        map_dept_norm = row["dept_norm"]
+        if map_dept_norm.startswith(dept_norm + "/"):
+            candidates.append(row)
+
+    if candidates:
+        candidates.sort(key=lambda x: len(x["dept_norm"]))
+        return candidates[0]
+
+    return None
+
+
+# =============================================================================
+# Todo API
+# =============================================================================
+
+def fetch_todo_list_by_owner(owner_guid):
+    print(f"🚀 开始获取 Todo 列表，owner_guid={owner_guid}")
+
+    request_body = {
+        "todoStatus": TODO_STATUS_LIST,
+        "ownerIds": [owner_guid],
+        "isLeaf": TODO_IS_LEAF
+    }
+
+    response = request_with_retry(
+        "post",
+        TODO_BASE_URL + TODO_LIST_API,
+        headers={
+            "x-user-guid": USER_GUID,
+            "Content-Type": "application/json"
+        },
+        json=request_body,
+        timeout=60
+    )
+
+    response.raise_for_status()
+    response_json = response.json()
+
+    if response_json.get("code") not in (0, 200, "0", "200", None):
+        print(f"⚠️ Todo API 返回 code 异常: {response_json.get('code')}")
+
+    todo_list = response_json.get("data") or []
+
+    print(f"✅ owner_guid={owner_guid} 获取 Todo 数量: {len(todo_list)}")
+
+    return todo_list
+
+
+def fetch_all_todos(owner_guid_list):
+    """
+    多个 owner 查询时，同一个父 Todo 可能重复返回。
+    这里按 todo.id 去重。
+    """
+    all_todos = []
+    seen_todo_ids = set()
+
+    for owner_guid in owner_guid_list:
+        todo_list = fetch_todo_list_by_owner(owner_guid)
+
+        for todo in todo_list:
+            todo_id = todo.get("id")
+            dedupe_key = str(todo_id) if todo_id is not None else json.dumps(
+                todo,
+                ensure_ascii=False,
+                sort_keys=True
+            )
+
+            if dedupe_key in seen_todo_ids:
+                continue
+
+            seen_todo_ids.add(dedupe_key)
+            all_todos.append(todo)
+
+    print(f"✅ 去重后 Todo 总数: {len(all_todos)}")
+
+    return all_todos
+
+
+# =============================================================================
+# Workspace 日报查找
+# =============================================================================
+
+def get_tree_node_title(node):
+    for key in ("dataTitle", "title", "name", "fileName", "filename"):
+        value = node.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def get_tree_node_guid(node):
+    for key in ("categoryGuid", "dataGuid", "guid", "fileGuid", "id"):
+        value = node.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def get_date_title_variants(date_str):
+    """
+    2026-05-11 ->
+    2026-05-11
+    2026/05/11
+    20260511
+    2026.05.11
+    2026年05月11日
+    2026年5月11日
+    """
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+
+    return [
+        dt.strftime("%Y-%m-%d"),
+        dt.strftime("%Y/%m/%d"),
+        dt.strftime("%Y%m%d"),
+        dt.strftime("%Y.%m.%d"),
+        dt.strftime("%Y年%m月%d日"),
+        f"{dt.year}年{dt.month}月{dt.day}日",
+    ]
+
+
+def is_daily_note_title(title, target_date, project_name=""):
+    title = title or ""
+
+    date_variants = get_date_title_variants(target_date)
+
+    has_date = any(x in title for x in date_variants)
+    if not has_date:
+        return False
+
+    has_keyword = any(keyword in title for keyword in DAILY_TITLE_KEYWORDS)
+    if not has_keyword:
+        return False
+
+    return True
+
+
+def score_daily_note_title(title, target_date, project_name=""):
+    """
+    多个候选日报时，用 score 选最像目标日报的。
+    """
+    score = 0
+    title = title or ""
+
+    if is_daily_note_title(title, target_date, project_name):
+        score += 100
+
+    if project_name and project_name in title:
+        score += 30
+
+    if "副本" in title:
+        score -= 20
+
+    if "测试" in title:
+        score -= 10
+
+    if title.endswith("日报"):
+        score += 5
+
+    return score
+
+
+def list_folder_nodes(user_guid, project_guid, folder_guid):
+    response = request_with_retry(
+        "post",
+        BASE_URL + DOC_TREE_ROUTE,
+        headers=get_headers_with_ak(user_guid=user_guid),
+        json={
+            "projectGuid": project_guid,
+            "parentGuid": folder_guid
+        },
+        timeout=60
+    )
+
+    if response.status_code != 200:
+        raise Exception(
+            f"treeList 请求失败: status={response.status_code}, text={response.text[:300]}"
+        )
+
+    response_json = response.json()
+    data = response_json.get("data") or []
+
+    return data
+
+
+def find_today_daily_note(user_guid, project_guid, folder_guid, target_date, project_name=""):
+    """
+    在目标项目日报文件夹下查找 target_date 当天日报。
+    """
+    print(
+        f"🔎 查找日报: project_guid={project_guid}, "
+        f"folder_guid={folder_guid}, date={target_date}, project_name={project_name}"
+    )
+
+    nodes = list_folder_nodes(
+        user_guid=user_guid,
+        project_guid=project_guid,
+        folder_guid=folder_guid
+    )
+
+    candidates = []
+
+    for node in nodes:
+        title = get_tree_node_title(node)
+        guid = get_tree_node_guid(node)
+
+        if not title or not guid:
+            continue
+
+        if not is_daily_note_title(title, target_date, project_name):
+            continue
+
+        candidates.append({
+            "note_guid": guid,
+            "note_title": title,
+            "score": score_daily_note_title(title, target_date, project_name),
+            "node": node
+        })
+
+    if not candidates:
+        print(
+            f"❌ 未找到当日日报: project_guid={project_guid}, "
+            f"folder_guid={folder_guid}, date={target_date}"
+        )
+        return None
+
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    best = candidates[0]
+
+    print(
+        f"✅ 命中日报: {best['note_title']} | "
+        f"note_guid={best['note_guid']} | score={best['score']}"
+    )
+
+    if len(candidates) > 1:
+        print("⚠️ 存在多个候选日报，已选择 score 最高的一个：")
+        for item in candidates:
+            print(f"    - score={item['score']} | {item['note_title']} | {item['note_guid']}")
+
+    return best
+
+
+# =============================================================================
+# 读取已有日报内容，用于去重
+# =============================================================================
+
+def extract_text_from_note_json_node(node, parts):
+    if isinstance(node, dict):
+        node_type = node.get("type")
+
+        if node_type == "text":
+            text = node.get("text", "")
+            if text:
+                parts.append(text)
+            return
+
+        if node_type in (
+            "paragraph",
+            "heading",
+            "fheading",
+            "bulletListItem",
+            "numberedListItem",
+            "codeBlock"
+        ):
+            for child in node.get("content", []) or []:
+                extract_text_from_note_json_node(child, parts)
+            parts.append("\n")
+            return
+
+        for key in ("text", "code"):
+            value = node.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value)
+                parts.append("\n")
+                return
+
+        for child in node.get("content", []) or []:
+            extract_text_from_note_json_node(child, parts)
+
+    elif isinstance(node, list):
+        for child in node:
+            extract_text_from_note_json_node(child, parts)
+
+
+def extract_text_from_note_json(raw_note_json):
+    root = raw_note_json.get("data", {}).get("content", []) or raw_note_json.get("content", [])
+    parts = []
+    extract_text_from_note_json_node(root, parts)
+    return "".join(parts).strip()
+
+
+def get_note_plain_text(user_guid, note_guid):
+    response = request_with_retry(
+        "get",
+        BASE_URL + NOTE_JSON_ROUTE,
+        headers=get_headers_with_ak(user_guid=user_guid),
+        params={
+            "docId": note_guid
+        },
+        timeout=60
+    )
+
+    response_json = response.json()
+
+    try:
+        return extract_text_from_note_json(response_json)
+    except Exception as e:
+        print(f"⚠️ 解析已有日报内容失败，跳过去重检查: note_guid={note_guid}, error={e}")
+        return ""
+
+
+def is_subtodo_already_written(existing_text, todo_code, sub_todo_id):
+    """
+    不再依赖 TODO_TRACE。
+    只要已有内容中同时出现 todo_code 和 sub_todo_id，就认为这个 subTodo 已经写过。
+    """
+    if str(todo_code) in existing_text and str(sub_todo_id) in existing_text:
+        return True
+
+    return False
+
+
+# =============================================================================
+# 构建 note -> owner -> tasks 中间态
+# =============================================================================
+
+def build_note_task_map(todo_list, mapping_rows, target_date):
+    """
+    输出结构：
+
+    {
+        note_guid: {
+            project_guid,
+            project_name,
+            work_log_folder_guid,
+            note_title,
+            dept,
+            owners: {
+                owner_guid: {
+                    owner_name,
+                    owner_display_name,
+                    owner_dept,
+                    tasks: []
+                }
+            }
+        }
+    }
+    """
+    note_task_map = OrderedDict()
+    daily_note_cache = {}
+
+    total_subtodo = 0
+    routed_subtodo = 0
+    skipped_no_owner = 0
+    skipped_no_mapping = 0
+    skipped_no_daily_note = 0
+
+    for todo in todo_list:
+        todo_id = todo.get("id", "")
+        todo_code = todo.get("code", "")
+        parent_title = todo.get("title", "")
+        parent_due_date = todo.get("dueDate", "")
+        risk_level = todo.get("riskLevel", "")
+        risk_text = RISK_MAP.get(risk_level, risk_level)
+
+        sub_todos = todo.get("subTodos", []) or []
+
+        if not sub_todos:
+            print(f"⚠️ 跳过无 subTodos 的 Todo: {parent_title}")
+            continue
+
+        for sub in sub_todos:
+            total_subtodo += 1
+
+            sub_todo_id = sub.get("id", "")
+            sub_title = sub.get("title", "")
+            sub_due_date = sub.get("dueDate") or parent_due_date
+            sub_status = sub.get("status", "")
+
+            owner = sub.get("owner", {}) or {}
+            owner_guid = owner.get("userGuid", "")
+            owner_name = owner.get("name", "")
+            owner_display_name = owner.get("displayName", owner_name)
+            owner_full_dept = owner.get("fullDeptName", "")
+
+            if not owner_guid:
+                skipped_no_owner += 1
+                print(
+                    f"⚠️ 跳过无 owner.userGuid 的 subTodo: "
+                    f"todo={todo_code}, subTodo={sub_todo_id}, title={sub_title}"
+                )
+                continue
+
+            mapping = find_mapping_by_dept(owner_full_dept, mapping_rows)
+
+            if not mapping:
+                skipped_no_mapping += 1
+                print(
+                    f"⚠️ 未找到部门 mapping，跳过: "
+                    f"owner={owner_display_name}, dept={owner_full_dept}, subTodo={sub_todo_id}"
+                )
+                continue
+
+            project_guid = mapping["project_guid"]
+            work_log_folder_guid = mapping["work_log_folder_guid"]
+            project_name = mapping.get("project_name", "")
+            mapping_dept = mapping["dept"]
+
+            cache_key = f"{project_guid}|{work_log_folder_guid}|{target_date}"
+
+            if cache_key not in daily_note_cache:
+                daily_note = find_today_daily_note(
+                    user_guid=USER_GUID,
+                    project_guid=project_guid,
+                    folder_guid=work_log_folder_guid,
+                    target_date=target_date,
+                    project_name=project_name
+                )
+                daily_note_cache[cache_key] = daily_note
+            else:
+                daily_note = daily_note_cache[cache_key]
+
+            if not daily_note:
+                skipped_no_daily_note += 1
+                print(
+                    f"⚠️ 未找到目标日报，跳过 subTodo: "
+                    f"owner={owner_display_name}, dept={owner_full_dept}, subTodo={sub_todo_id}"
+                )
+                continue
+
+            note_guid = daily_note["note_guid"]
+            note_title = daily_note["note_title"]
+
+            if note_guid not in note_task_map:
+                note_task_map[note_guid] = {
+                    "project_guid": project_guid,
+                    "project_name": project_name,
+                    "work_log_folder_guid": work_log_folder_guid,
+                    "note_guid": note_guid,
+                    "note_title": note_title,
+                    "dept": mapping_dept,
+                    "owners": OrderedDict()
+                }
+
+            owners = note_task_map[note_guid]["owners"]
+
+            if owner_guid not in owners:
+                owners[owner_guid] = {
+                    "owner_guid": owner_guid,
+                    "owner_name": owner_name,
+                    "owner_display_name": owner_display_name,
+                    "owner_dept": owner_full_dept,
+                    "tasks": []
+                }
+
+            owners[owner_guid]["tasks"].append({
+                "todo_id": todo_id,
+                "todo_code": todo_code,
+                "parent_title": parent_title,
+                "subtodo_id": sub_todo_id,
+                "subtodo_title": sub_title,
+                "due_date": sub_due_date,
+                "risk_level": risk_level,
+                "risk_text": risk_text,
+                "status": sub_status
+            })
+
+            routed_subtodo += 1
+
+    print("\n================ 路由统计 ================\n")
+    print(f"subTodo 总数: {total_subtodo}")
+    print(f"成功路由: {routed_subtodo}")
+    print(f"跳过：无 owner: {skipped_no_owner}")
+    print(f"跳过：无 mapping: {skipped_no_mapping}")
+    print(f"跳过：无当日日报: {skipped_no_daily_note}")
+    print(f"目标日报数量: {len(note_task_map)}")
+    print("\n==========================================\n")
+
+    return note_task_map
+
+
+# =============================================================================
+# Markdown / HTML 构建
+# =============================================================================
+
+def escape_html(text):
+    text = str(text or "")
+    return (
+        text
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def build_task_block(task):
+    """
+    单个 subTodo 的展示块。
+
+    展示目标：
+
+    🚀 【父任务标题】&【子任务标题】&【Todo Code】&【subTodo ID】
+
+    <承诺完成时间：YYYY-MM-DD>:
+    <风险等级：中>:
+    今日进展描述:
+      - 完成了xxx
+      - 开发了xxx
+
+    注意：
+    - 承诺完成时间固定显示 YYYY-MM-DD，作为用户填写格式提示。
+    - 不自动填入 subTodo.dueDate。
+    - 不展示 TODO_TRACE。
+    """
+    parent_title = escape_html(task.get("parent_title", ""))
+    sub_title = escape_html(task.get("subtodo_title", ""))
+    todo_code = escape_html(task.get("todo_code", ""))
+    sub_todo_id = escape_html(task.get("subtodo_id", ""))
+    risk_text = escape_html(task.get("risk_text", "") or "高/中/低")
+
+    return f"""
+<p>🚀 <strong>【{parent_title}】&amp;【{sub_title}】&amp;【{todo_code}】&amp;【{sub_todo_id}】</strong></p>
+
+<p>
+<strong>&lt;承诺完成时间：YYYY-MM-DD&gt;:</strong><br>
+<strong>&lt;风险等级：{risk_text}&gt;:</strong><br>
+<strong>今日进展描述:</strong>
+</p>
+
+<ul>
+<li>完成了xxx</li>
+<li>开发了xxx</li>
+</ul>
+"""
+
+
+def build_owner_block(owner_info):
+    """
+    单个负责人下的任务块。
+
+    展示目标：
+    ### @负责人
+
+    task1
+
+    task2
+    """
+    owner_name = escape_html(owner_info.get("owner_name", ""))
+
+    task_blocks = []
+
+    for task in owner_info.get("tasks", []) or []:
+        task_blocks.append(build_task_block(task))
+
+    if not task_blocks:
+        return ""
+
+    return f"""
+<h3>@{owner_name}</h3>
+
+{''.join(task_blocks)}
+"""
+
+
+def build_markdown_for_note(note_info):
+    """
+    为单个项目当日日报构建写入内容。
+
+    展示目标：
+    ## TodoList任务进展
+
+    ### @负责人A
+
+    负责人A的多个 subTodo
+
+    ### @负责人B
+
+    负责人B的多个 subTodo
+
+    注意：
+    - 不展示“项目：xxx”。
+    - 不展示 owner_display_name / owner_dept。
+    - 一个 note_guid 只生成一个 h2。
+    - 同一个 owner 下多个 subTodo 合并到一个 h3 下。
+    """
+    owner_blocks = []
+
+    for owner_guid, owner_info in note_info.get("owners", {}).items():
+        block = build_owner_block(owner_info)
+        if block.strip():
+            owner_blocks.append(block)
+
+    if not owner_blocks:
+        return ""
+
+    return f"""
+<h2>{DAILY_SECTION_TITLE}</h2>
+
+{''.join(owner_blocks)}
+
+<hr>
+"""
+
+
+# =============================================================================
+# 写入日报
+# =============================================================================
+
+def filter_existing_tasks(note_guid, note_info):
+    """
+    如果 SKIP_EXISTING_SUBTODO=True，则读取已有日报内容，过滤已经写过的 subTodo。
+    """
+    if not SKIP_EXISTING_SUBTODO:
+        return note_info
+
+    existing_text = get_note_plain_text(USER_GUID, note_guid)
+
+    if not existing_text:
+        return note_info
+
+    filtered_note_info = dict(note_info)
+    filtered_owners = OrderedDict()
+
+    skipped_count = 0
+    kept_count = 0
+
+    for owner_guid, owner_info in note_info.get("owners", {}).items():
+        filtered_owner = dict(owner_info)
+        filtered_tasks = []
+
+        for task in owner_info.get("tasks", []) or []:
+            todo_code = task.get("todo_code", "")
+            sub_todo_id = task.get("subtodo_id", "")
+
+            if is_subtodo_already_written(existing_text, todo_code, sub_todo_id):
+                skipped_count += 1
+                print(
+                    f"ℹ️ 已存在，跳过写入: "
+                    f"note={note_guid}, todo={todo_code}, subTodo={sub_todo_id}"
+                )
+                continue
+
+            filtered_tasks.append(task)
+            kept_count += 1
+
+        if filtered_tasks:
+            filtered_owner["tasks"] = filtered_tasks
+            filtered_owners[owner_guid] = filtered_owner
+
+    filtered_note_info["owners"] = filtered_owners
+
+    print(f"📌 note={note_guid} 去重结果：保留 {kept_count} 条，跳过 {skipped_count} 条")
+
+    return filtered_note_info
+
+
+def insert_markdown_to_note(note_guid, markdown_content):
+    if not markdown_content.strip():
+        print(f"ℹ️ note={note_guid} 无可写入内容，跳过")
+        return None
+
+    payload = {
+        "note_guid": note_guid,
+        "markdown_content": markdown_content,
+        "mode": DAILY_INSERT_MODE,
+        "location": DAILY_INSERT_LOCATION
+    }
+
+    response = request_with_retry(
+        "post",
+        BASE_URL + MD_INSERT_ROUTE,
+        headers=get_headers_with_ak(user_guid=USER_GUID),
+        json=payload,
+        timeout=60
+    )
+
+    if response.status_code != 200:
+        raise Exception(
+            f"写入笔记失败: status={response.status_code}, text={response.text[:500]}"
+        )
+
+    response_json = response.json()
+
+    print(f"✅ 写入成功: note_guid={note_guid}")
+
+    return response_json
+
+
+def write_all_notes(note_task_map):
+    success_count = 0
+    skip_count = 0
+    fail_count = 0
+
+    for note_guid, note_info in note_task_map.items():
+        print("\n------------------------------------------")
+        print(f"🚀 开始处理日报: {note_info.get('note_title')} | {note_guid}")
+
+        try:
+            filtered_note_info = filter_existing_tasks(note_guid, note_info)
+            markdown_content = build_markdown_for_note(filtered_note_info)
+
+            print("\n================ 写入内容预览 ================\n")
+            print(markdown_content)
+            print("\n==============================================\n")
+
+            if not markdown_content.strip():
+                print(f"ℹ️ 当前日报无新增任务，跳过: {note_guid}")
+                skip_count += 1
+                continue
+
+            insert_markdown_to_note(note_guid, markdown_content)
+            success_count += 1
+
+        except Exception as e:
+            fail_count += 1
+            print(f"❌ 写入失败: note_guid={note_guid}, error={e}")
+            print(traceback.format_exc())
+
+    print("\n================ 写入统计 ================\n")
+    print(f"成功写入日报数: {success_count}")
+    print(f"无新增跳过日报数: {skip_count}")
+    print(f"失败日报数: {fail_count}")
+    print("\n==========================================\n")
+
+    if fail_count > 0:
+        raise Exception(f"存在 {fail_count} 个日报写入失败，请查看日志")
+
+
+# =============================================================================
+# 主流程
+# =============================================================================
+
+
+print("\n==========================================")
+print("🚀 Todo subTodo 写入项目日报应用启动")
+print("==========================================\n")
+
+print(f"BASE_URL: {BASE_URL}")
+print(f"TARGET_DATE: {TARGET_DATE}")
+print(f"USER_GUID: {USER_GUID}")
+print(f"OWNER_GUID_LIST: {OWNER_GUID_LIST}")
+print(f"MAPPING_GUID: {MAPPING_GUID}")
+
+mapping_rows = load_mapping_from_guid(MAPPING_GUID)
+
+todo_list = fetch_all_todos(OWNER_GUID_LIST)
+
+if not todo_list:
+    print("ℹ️ 当前未获取到 Todo 数据，流程结束")
+    return
+
+note_task_map = build_note_task_map(
+    todo_list=todo_list,
+    mapping_rows=mapping_rows,
+    target_date=TARGET_DATE
+)
+
+if not note_task_map:
+    print("ℹ️ 当前没有可写入日报的 subTodo，流程结束")
+    return
+
+write_all_notes(note_task_map)
+
+print("\n🏁 Todo subTodo 写入项目日报应用完成\n")
